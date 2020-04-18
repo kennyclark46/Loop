@@ -10,21 +10,45 @@ import WatchKit
 import WatchConnectivity
 import CGMBLEKit
 import LoopKit
+import HealthKit
 import SpriteKit
 import os.log
 
 final class ChartHUDController: HUDInterfaceController, WKCrownDelegate {
-    @IBOutlet weak var basalLabel: WKInterfaceLabel!
-    @IBOutlet weak var iobLabel: WKInterfaceLabel!
-    @IBOutlet weak var cobLabel: WKInterfaceLabel!
-    @IBOutlet weak var glucoseScene: WKInterfaceSKScene!
-    @IBAction func setChartWindow1Hour() {
+    private enum TableRow: Int, CaseIterable {
+        case iob
+        case cob
+        case netBasal
+        case reservoirVolume
+
+        var title: String {
+            switch self {
+            case .iob:
+                return NSLocalizedString("Active Insulin", comment: "HUD row title for IOB")
+            case .cob:
+                return NSLocalizedString("Active Carbs", comment: "HUD row title for COB")
+            case .netBasal:
+                return NSLocalizedString("Net Basal Rate", comment: "HUD row title for Net Basal Rate")
+            case .reservoirVolume:
+                return NSLocalizedString("Reservoir Volume", comment: "HUD row title for remaining reservoir volume")
+            }
+        }
+
+        var isLast: Bool {
+            return self == TableRow.allCases.last
+        }
+    }
+
+    @IBOutlet private weak var table: WKInterfaceTable!
+
+    @IBOutlet private weak var glucoseScene: WKInterfaceSKScene!
+    @IBAction private func setChartWindow1Hour() {
         scene.visibleDuration = .hours(2)
     }
-    @IBAction func setChartWindow2Hours() {
+    @IBAction private func setChartWindow2Hours() {
         scene.visibleDuration = .hours(4)
     }
-    @IBAction func setChartWindow3Hours() {
+    @IBAction private func setChartWindow3Hours() {
         scene.visibleDuration = .hours(6)
     }
     private let scene = GlucoseChartScene()
@@ -36,31 +60,43 @@ final class ChartHUDController: HUDInterfaceController, WKCrownDelegate {
     private let log = OSLog(category: "ChartHUDController")
     private var hasInitialActivation = false
 
+    private var observers: [Any] = [] {
+        didSet {
+            for observer in oldValue {
+                NotificationCenter.default.removeObserver(observer)
+            }
+        }
+    }
+
     override init() {
         super.init()
 
-        loopManager = ExtensionDelegate.shared().loopManager
-        NotificationCenter.default.addObserver(forName: .GlucoseSamplesDidChange, object: loopManager.glucoseStore, queue: nil) { [weak self] (note) in
-            self?.log.default("Received GlucoseSamplesDidChange notification: %{public}@. Updating chart", String(describing: note.userInfo ?? [:]))
-
-            DispatchQueue.main.async {
-                self?.updateGlucoseChart()
-            }
-        }
-
         glucoseScene.presentScene(scene)
+    }
+
+    override func awake(withContext context: Any?) {
+        super.awake(withContext: context)
+
+        table.setNumberOfRows(TableRow.allCases.count, withRowType: HUDRowController.className)
     }
 
     override func didAppear() {
         super.didAppear()
 
-        log.default("didAppear")
+        if glucoseScene.isPaused {
+            log.default("didAppear() unpausing")
+            glucoseScene.isPaused = false
+        } else {
+            log.default("didAppear() not paused")
+            glucoseScene.isPaused = false
+        }
 
         // Force an update when our pixels need to move
         let pixelsWide = scene.size.width * WKInterfaceDevice.current().screenScale
         let pixelInterval = scene.visibleDuration / TimeInterval(pixelsWide)
 
         timer = Timer.scheduledTimer(withTimeInterval: pixelInterval, repeats: true) { [weak self] _ in
+            self?.log.default("Timer fired, triggering update")
             self?.scene.setNeedsUpdate()
         }
 
@@ -81,11 +117,21 @@ final class ChartHUDController: HUDInterfaceController, WKCrownDelegate {
     override func willActivate() {
         super.willActivate()
 
+        observers = [
+            NotificationCenter.default.addObserver(forName: GlucoseStore.glucoseSamplesDidChange, object: loopManager.glucoseStore, queue: nil) { [weak self] (note) in
+                self?.log.default("Received GlucoseSamplesDidChange notification: %{public}@. Updating chart", String(describing: note.userInfo ?? [:]))
+
+                DispatchQueue.main.async {
+                    self?.updateGlucoseChart()
+                }
+            }
+        ]
+
         if glucoseScene.isPaused {
             log.default("willActivate() unpausing")
             glucoseScene.isPaused = false
         } else {
-            log.default("willActivate() unpausing")
+            log.default("willActivate()")
         }
 
         if !hasInitialActivation && UserDefaults.standard.startOnChartPage {
@@ -101,6 +147,8 @@ final class ChartHUDController: HUDInterfaceController, WKCrownDelegate {
     override func didDeactivate() {
         super.didDeactivate()
 
+        observers = []
+
         log.default("didDeactivate() pausing")
         glucoseScene.isPaused = true
     }
@@ -112,58 +160,24 @@ final class ChartHUDController: HUDInterfaceController, WKCrownDelegate {
             return
         }
 
-        let insulinFormatter: NumberFormatter = {
-            let numberFormatter = NumberFormatter()
+        for row in TableRow.allCases {
+            let cell = table.rowController(at: row.rawValue) as! HUDRowController
+            cell.setTitle(row.title)
+            cell.setIsLastRow(row.isLast)
+            if #available(watchOSApplicationExtension 5.0, *) {
+                cell.setContentInset(systemMinimumLayoutMargins)
+            }
 
-            numberFormatter.numberStyle = .decimal
-            numberFormatter.minimumFractionDigits = 1
-            numberFormatter.maximumFractionDigits = 1
-
-            return numberFormatter
-        }()
-
-        iobLabel.setHidden(true)
-        if let activeInsulin = activeContext.iob, let valueStr = insulinFormatter.string(from: activeInsulin) {
-            iobLabel.setText(String(format: NSLocalizedString(
-                    "IOB %1$@ U",
-                    comment: "The subtitle format describing units of active insulin. (1: localized insulin value description)"
-                ),
-                valueStr
-            ))
-            iobLabel.setHidden(false)
-        }
-
-        cobLabel.setHidden(true)
-        if let carbsOnBoard = activeContext.cob {
-            let carbFormatter = NumberFormatter()
-            carbFormatter.numberStyle = .decimal
-            carbFormatter.maximumFractionDigits = 0
-            let valueStr = carbFormatter.string(from: carbsOnBoard)
-
-            cobLabel.setText(String(format: NSLocalizedString(
-                    "COB %1$@ g",
-                    comment: "The subtitle format describing grams of active carbs. (1: localized carb value description)"
-                ),
-                valueStr!
-            ))
-            cobLabel.setHidden(false)
-        }
-
-        basalLabel.setHidden(true)
-        if let tempBasal = activeContext.lastNetTempBasalDose {
-            let basalFormatter = NumberFormatter()
-            basalFormatter.numberStyle = .decimal
-            basalFormatter.minimumFractionDigits = 1
-            basalFormatter.maximumFractionDigits = 3
-            basalFormatter.positivePrefix = basalFormatter.plusSign
-            let valueStr = basalFormatter.string(from: tempBasal)
-
-            let basalLabelText = String(format: NSLocalizedString(
-                "%1$@ U/hr",
-                comment: "The subtitle format describing the current temp basal rate. (1: localized basal rate description)"),
-                                      valueStr!)
-            basalLabel.setText(basalLabelText)
-            basalLabel.setHidden(false)
+            switch row {
+            case .iob:
+                cell.setActiveInsulin(activeContext.activeInsulin)
+            case .cob:
+                cell.setActiveCarbohydrates(activeContext.activeCarbohydrates)
+            case .netBasal:
+                cell.setNetTempBasalDose(activeContext.lastNetTempBasalDose)
+            case .reservoirVolume:
+                cell.setReservoirVolume(activeContext.reservoirVolume)
+            }
         }
 
         if glucoseScene.isPaused {
@@ -174,20 +188,20 @@ final class ChartHUDController: HUDInterfaceController, WKCrownDelegate {
         updateGlucoseChart()
     }
 
-    func updateGlucoseChart() {
-        guard let activeContext = loopManager.activeContext else {
-            return
-        }
-
-        scene.predictedGlucose = activeContext.predictedGlucose?.values
-        scene.correctionRange = loopManager.settings.glucoseTargetRangeSchedule
-        scene.unit = activeContext.preferredGlucoseUnit
-
-        loopManager.glucoseStore.getCachedGlucoseSamples(start: .earliestGlucoseCutoff) { (samples) in
+    private func updateGlucoseChart() {
+        loopManager.generateChartData { chartData in
             DispatchQueue.main.async {
-                self.scene.historicalGlucose = samples
+                self.scene.data = chartData
                 self.scene.setNeedsUpdate()
             }
         }
+    }
+
+    override func table(_ table: WKInterfaceTable, didSelectRowAt rowIndex: Int) {
+        guard table == self.table, case .cob? = TableRow(rawValue: rowIndex) else {
+            return
+        }
+
+        presentController(withName: CarbEntryListController.className, context: nil)
     }
 }
